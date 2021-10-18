@@ -85,7 +85,28 @@ fn test_reelection_2a() {
 
     cfg.end();
 }
+#[test]
+fn test_many_elections_2a() {
+    let servers = 7;
+    let mut cfg = Config::new(servers, false);
+    cfg.begin("Test (2A): multiple elections");
 
+    cfg.check_one_leader();
+
+    let mut random = rand::thread_rng();
+    let iters = 10;
+    for _ in 1..=iters {
+        let is = (0..3)
+            .map(|_| random.gen_range(0, servers))
+            .collect::<Vec<_>>();
+        is.iter().for_each(|i| cfg.disconnect(*i));
+        cfg.check_one_leader();
+        is.iter().for_each(|i| cfg.connect(*i));
+    }
+
+    cfg.check_one_leader();
+    cfg.end();
+}
 #[test]
 fn test_basic_agree_2b() {
     let servers = 5;
