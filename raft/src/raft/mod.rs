@@ -55,8 +55,14 @@ pub enum Role {
 
 /// RpcEvent
 pub enum Event {
-    RequestVoteReply { reply: RequestVoteReply },
-    AppendEntriesReply { reply: AppendEntriesReply },
+    RequestVoteReply {
+        reply: RequestVoteReply,
+    },
+    AppendEntriesReply {
+        reply: AppendEntriesReply,
+        is_heart: bool,
+        new_next_index: usize,
+    },
     ResetTimeout,
     Timeout,
     HeartBeat,
@@ -78,10 +84,12 @@ pub struct Raft {
     current_term: u64,
 
     vote_for: Option<u64>,
-
+    //Candidate
     vote_from: HashSet<u64>,
-
-    log: Vec<(u64, Entry)>,
+    //Leader
+    next_index: Vec<usize>,
+    match_index: Vec<usize>,
+    log: Vec<Entry>,
 
     commit_index: u64,
 
@@ -120,20 +128,18 @@ impl Raft {
             vote_for: None,
             vote_from: HashSet::new(),
             log: vec![],
+            next_index: vec![],
+            match_index: vec![],
             commit_index: 0,
             last_applied: 0,
             apply_tx: apply_ch,
             event_loop_tx: None,
             executor: ThreadPool::new().unwrap(),
         };
-        rf.log.push((
-            1,
-            Entry {
-                entry_term: 0,
-                data: vec![],
-            },
-        ));
-
+        rf.log.push(Entry {
+            entry_term: 0,
+            data: vec![],
+        });
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
 
@@ -172,20 +178,27 @@ impl Raft {
             "{:>} trans {:?} to {:?} in term {:?}",
             self.me, self.role, role, self.current_term
         );
+
         self.role = role;
         self.vote_for = None;
-        self.vote_from = HashSet::new();
+
         self.event_loop_tx
             .as_ref()
             .unwrap()
             .unbounded_send(Event::ResetTimeout)
             .unwrap();
+
         match self.role {
             Role::Candidate => {
                 self.current_term += 1;
+                self.vote_from = HashSet::new();
                 self.hold_election();
             }
-            Role::Leader => self.heart_beat(),
+            Role::Leader => {
+                self.next_index = vec![self.log.len(); self.peers.len()];
+                self.match_index = vec![0; self.peers.len()];
+                self.send_all_heart_beat();
+            }
             Role::Follower => { /*undo*/ }
         }
     }
@@ -218,6 +231,8 @@ impl Raft {
     // });
     // rx
     // ```
+
+    /// send all request vote
     fn send_request_vote(&self, args: RequestVoteArgs) {
         for (id, peer) in self.peers.iter().enumerate() {
             if id == self.me {
@@ -240,54 +255,62 @@ impl Raft {
                 .unwrap();
         }
     }
-    fn send_append_entry(&self, entry: AppendEntriesArgs) {
-        for (id, peer) in self.peers.iter().enumerate() {
-            if id == self.me {
-                continue;
-            }
-            let tx = self
-                .event_loop_tx
-                .as_ref()
-                .expect("no event sender")
-                .clone();
-            let peer_clone = peer.clone();
-            let args = entry.clone();
-            self.executor
-                .spawn(async move {
-                    if let Ok(reply) = peer_clone.append_entries(&args).await.map_err(Error::Rpc) {
-                        tx.unbounded_send(Event::AppendEntriesReply { reply })
-                            .unwrap();
-                    }
-                })
-                .unwrap();
-        }
+    fn send_append_entry(&self, id: usize, entry: AppendEntriesArgs, is_heart: bool) {
+        let tx = self
+            .event_loop_tx
+            .as_ref()
+            .expect("no event sender")
+            .clone();
+        let peer_clone = self.peers[id].clone();
+        let new_next_index = self.log.len();
+        self.executor
+            .spawn(async move {
+                if let Ok(reply) = peer_clone.append_entries(&entry).await.map_err(Error::Rpc) {
+                    tx.unbounded_send(Event::AppendEntriesReply {
+                        reply,
+                        is_heart,
+                        new_next_index,
+                    })
+                    .unwrap();
+                }
+            })
+            .unwrap();
     }
 
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
+    fn start<M>(&mut self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
     {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
-        // Your code here (2B).
-
-        if is_leader {
-            Ok((index, term))
-        } else {
-            Err(Error::NotLeader)
+        match self.role {
+            Role::Leader => {
+                let mut data = vec![];
+                labcodec::encode(command, &mut data).map_err(Error::Encode)?;
+                self.log.push(Entry {
+                    entry_term: self.current_term,
+                    data,
+                });
+                self.sync_log();
+                Ok((self.last_log_index(), self.last_log_term()))
+            }
+            _ => Err(Error::NotLeader),
         }
     }
 }
 impl Raft {
     fn handle_task(&mut self, event: Event) {
         match event {
-            Event::RequestVoteReply { reply } => self.handle_request_reply(reply),
-            Event::AppendEntriesReply { reply } => self.handle_append_reply(reply),
+            Event::AppendEntriesReply {
+                reply,
+                is_heart,
+                new_next_index,
+            } if self.role == Role::Leader => {
+                self.handle_append_reply(reply, is_heart, new_next_index);
+            }
+            Event::RequestVoteReply { reply } if self.role == Role::Candidate => {
+                self.handle_request_reply(reply);
+            }
             Event::Timeout if self.role != Role::Leader => self.trans_role(Role::Candidate),
-            Event::HeartBeat if self.role == Role::Leader => self.heart_beat(),
+            Event::HeartBeat if self.role == Role::Leader => self.send_all_heart_beat(),
             _ => {}
         }
     }
@@ -298,7 +321,7 @@ impl Raft {
         }
         match self.role {
             Role::Candidate => {
-                if reply.vote_granted {
+                if reply.vote_granted && reply.term == self.current_term {
                     self.vote_from.insert(reply.id);
                     if self.vote_from.len() * 2 > self.peers.len() {
                         self.trans_role(Role::Leader);
@@ -308,10 +331,21 @@ impl Raft {
             _ => {}
         }
     }
-    fn handle_append_reply(&mut self, reply: AppendEntriesReply) {
+
+    ///NEXT TO DO
+    fn handle_append_reply(
+        &mut self,
+        reply: AppendEntriesReply,
+        is_heart: bool,
+        new_next_index: usize,
+    ) {
         if reply.term > self.current_term {
-            self.current_term = reply.term;
-            self.trans_role(Role::Candidate);
+            self.current_term = reply.term; //update
+            self.trans_role(Role::Follower);
+        }
+        // heartbeat has no need
+        if is_heart {
+            return;
         }
         match self.role {
             Role::Leader => {}
@@ -324,19 +358,62 @@ impl Raft {
         self.send_request_vote(RequestVoteArgs {
             term: self.current_term,
             candidate_id: self.me as u64,
-            last_log_index: self.log.len() as u64 - 1,
-            last_log_term: self.log.last().unwrap().0,
+            last_log_index: self.last_log_index(),
+            last_log_term: self.last_log_term(),
         });
     }
-    fn heart_beat(&mut self) {
-        self.send_append_entry(AppendEntriesArgs {
-            term: self.current_term,
-            leader_id: self.me as u64,
-            prev_log_index: self.log.len() as u64,
-            prev_log_term: self.log.last().unwrap().0,
-            entries: vec![],
-            leader_commit_index: self.commit_index as u64,
-        });
+    fn send_append_entries(&self, at: usize, to: usize) {
+        let entries = self.log[at..].iter().cloned().collect();
+        let prev_log_index = at - 1;
+
+        self.send_append_entry(
+            to,
+            AppendEntriesArgs {
+                entries,
+                prev_log_index: prev_log_index as u64,
+                term: self.current_term,
+                leader_id: self.me as u64,
+                prev_log_term: self.log[prev_log_index].entry_term,
+                leader_commit_index: self.commit_index,
+            },
+            false,
+        );
+    }
+    /// send heart-beat to all peers
+    fn send_all_heart_beat(&mut self) {
+        for (id, _) in self.peers.iter().enumerate() {
+            if id == self.me {
+                continue;
+            }
+            self.send_append_entry(
+                id,
+                AppendEntriesArgs {
+                    term: self.current_term,
+                    leader_id: self.me as u64,
+                    prev_log_index: self.log.len() as u64,
+                    prev_log_term: self.log.last().unwrap().entry_term,
+                    entries: vec![],
+                    leader_commit_index: self.commit_index as u64,
+                },
+                true,
+            );
+        }
+    }
+}
+impl Raft {
+    fn last_log_index(&self) -> u64 {
+        self.log.len() as u64 - 1
+    }
+    fn last_log_term(&self) -> u64 {
+        self.log.last().unwrap().entry_term
+    }
+    fn sync_log(&self) {
+        for (id, _) in self.peers.iter().enumerate() {
+            if id == self.me {
+                continue;
+            }
+            self.send_append_entries(self.next_index[id], id);
+        }
     }
 }
 
@@ -500,50 +577,56 @@ impl RaftService for Node {
         // Your code here (2A, 2B).
         let mut raft = self.raft.lock().unwrap();
 
-        if args.term >= raft.current_term {
+        if args.term > raft.current_term {
             raft.trans_role(Role::Follower);
             raft.current_term = args.term;
         }
         let term = raft.current_term;
-        let mut vote_granted = true;
-        match raft.role {
-            Role::Follower => {
-                if raft.vote_for != None {
-                    vote_granted = false;
-                }
-                if vote_granted {
-                    raft.vote_for = Some(args.candidate_id);
-                }
-            }
-            _ => vote_granted = false,
-        }
-
+        let up_to_date = (args.last_log_index, args.last_log_term)
+            >= (raft.last_log_index(), raft.last_log_term());
+        let vote_granted = match raft.role {
+            Role::Follower if raft.vote_for == None && up_to_date => true,
+            _ => false,
+        };
         Ok(RequestVoteReply {
             id: raft.me as u64,
             term,
             vote_granted,
         })
     }
-
+    ///AppendEntriesArgs RPC handler
+    ///handle append_entries_args
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
         let mut raft = self.raft.lock().unwrap();
-
+        //initialize
         if args.term >= raft.current_term {
             raft.trans_role(Role::Follower);
             raft.current_term = args.term;
         }
         let term = raft.current_term;
         let mut success = true;
+
+        //match
         match raft.role {
             Role::Follower => {
                 if raft.current_term > args.term {
                     success = false;
                 }
+                if (raft.log.len() < args.prev_log_index as usize
+                    || raft.log[args.prev_log_index as usize]
+                        != args.entries[args.prev_log_index as usize])
+                    && term == args.prev_log_term
+                {
+                    success = false;
+                }
             }
-
             _ => success = false,
         }
 
-        Ok(AppendEntriesReply { term, success })
+        Ok(AppendEntriesReply {
+            from: raft.me as u64,
+            term,
+            success,
+        })
     }
 }

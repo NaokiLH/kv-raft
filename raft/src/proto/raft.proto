@@ -33,7 +33,8 @@ message AppendEntriesArgs {
     uint64 leader_commit_index = 6;
 }
 message AppendEntriesReply {
-    uint64 term = 1;
-    bool success = 2;
+    uint64 from = 1;
+    uint64 term = 2;
+    bool success = 3;
 }
   
