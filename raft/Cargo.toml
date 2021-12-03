@@ -9,7 +9,7 @@ authors = [
     "MIT 6.82/4 <6824-staff@lists.csail.mit.edu>",
     "NaokiLH <naokilh114514@gmail.com>",
 ]
-edition = "2018"
+edition = "2021"
 publish = false
 
 [dependencies]
@@ -20,6 +20,7 @@ log = "0.4"
 prost = "0.6"
 prost-derive = "0.6"
 rand = "0.7"
+
 
 labcodec = { path = "../labcodec" }
 labrpc = { path = "../labrpc" }

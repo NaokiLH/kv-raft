@@ -128,6 +128,15 @@ fn test_basic_agree_2b() {
 
     cfg.end()
 }
+#[test]
+fn test_for_log_len_2b() {
+    let servers = 3;
+    let mut cfg = Config::new(servers, false);
+    cfg.begin("Test (2B): for_log_len");
+
+    cfg.one(Entry { x: 1 }, 1, false);
+    let leader = cfg.check_one_leader();
+}
 
 #[test]
 fn test_fail_agree_2b() {
@@ -322,7 +331,7 @@ fn test_rejoin_2b() {
     // leader network failure
     let leader1 = cfg.check_one_leader();
     cfg.disconnect(leader1);
-
+    println!("disconnected leader {}", leader1);
     // make old leader try to agree on some entries
     let _ = cfg.rafts.lock().unwrap()[leader1]
         .as_ref()
@@ -343,14 +352,14 @@ fn test_rejoin_2b() {
     // new leader network failure
     let leader2 = cfg.check_one_leader();
     cfg.disconnect(leader2);
-
+    println!("disconnected leader {}", leader2);
     // old leader connected again
     cfg.connect(leader1);
-
+    println!("connected leader {}", leader1);
     cfg.one(Entry { x: 104 }, 2, true);
-
     // all together now
     cfg.connect(leader2);
+    println!("connected leader {}", leader2);
 
     cfg.one(Entry { x: 105 }, servers, true);
 

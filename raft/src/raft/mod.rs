@@ -54,6 +54,7 @@ pub enum Role {
 }
 
 /// RpcEvent
+#[derive(Debug)]
 pub enum Event {
     RequestVoteReply {
         reply: RequestVoteReply,
@@ -137,7 +138,7 @@ impl Raft {
             executor: ThreadPool::new().unwrap(),
         };
         rf.log.push(Entry {
-            entry_term: 0,
+            term: 0,
             data: vec![],
         });
         // initialize from state persisted before a crash
@@ -174,14 +175,8 @@ impl Raft {
         // }
     }
     fn trans_role(&mut self, role: Role) {
-        println!(
-            "{:>} trans {:?} to {:?} in term {:?}",
-            self.me, self.role, role, self.current_term
-        );
-
         self.role = role;
         self.vote_for = None;
-
         self.event_loop_tx
             .as_ref()
             .unwrap()
@@ -195,6 +190,8 @@ impl Raft {
                 self.hold_election();
             }
             Role::Leader => {
+                println!("{} become leader", self.me);
+                //println!("{:?}", self.log);
                 self.next_index = vec![self.log.len(); self.peers.len()];
                 self.match_index = vec![0; self.peers.len()];
                 self.send_all_heart_beat();
@@ -202,6 +199,30 @@ impl Raft {
             Role::Follower => { /*undo*/ }
         }
     }
+    fn start<M>(&mut self, command: &M) -> Result<(u64, u64)>
+    where
+        M: labcodec::Message,
+    {
+        match self.role {
+            Role::Leader => {
+                let mut data = vec![];
+                labcodec::encode(command, &mut data).map_err(Error::Encode)?;
+                let entry = Entry {
+                    term: self.current_term,
+                    data,
+                };
+                //println!("{} get a entry {:?}", self.me, entry);
+                self.log.push(entry);
+                //println!("{} now log {:?}", self.me, self.log);
+                self.sync_log();
+                Ok((self.last_log_index(), self.last_log_term()))
+            }
+            _ => Err(Error::NotLeader),
+        }
+    }
+}
+///Elections and RequestVote
+impl Raft {
     /// example code to send a RequestVote RPC to a server.
     /// server is the index of the target server in peers.
     /// expects RPC arguments in args.
@@ -231,7 +252,6 @@ impl Raft {
     // });
     // rx
     // ```
-
     /// send all request vote
     fn send_request_vote(&self, args: RequestVoteArgs) {
         for (id, peer) in self.peers.iter().enumerate() {
@@ -245,6 +265,7 @@ impl Raft {
                 .clone();
             let peer_clone = peer.clone();
             let args = args.clone();
+
             self.executor
                 .spawn(async move {
                     if let Ok(reply) = peer_clone.request_vote(&args).await.map_err(Error::Rpc) {
@@ -255,6 +276,38 @@ impl Raft {
                 .unwrap();
         }
     }
+    fn handle_request_reply(&mut self, reply: RequestVoteReply) {
+        if reply.term > self.current_term {
+            self.current_term = reply.term;
+            self.trans_role(Role::Follower);
+        }
+        match self.role {
+            Role::Candidate => {
+                if reply.vote_granted && reply.term == self.current_term {
+                    self.vote_from.insert(reply.id);
+                    if self.vote_from.len() * 2 > self.peers.len() {
+                        self.trans_role(Role::Leader);
+                    }
+                }
+            }
+            _ => { /*"other role can't handle request vote"*/ }
+        }
+    }
+    fn hold_election(&mut self) {
+        println!("{} start election", self.me);
+        self.vote_for = Some(self.me as u64);
+        self.vote_from.insert(self.me as u64);
+        self.send_request_vote(RequestVoteArgs {
+            term: self.current_term,
+            candidate_id: self.me as u64,
+            last_log_index: self.last_log_index(),
+            last_log_term: self.last_log_term(),
+        });
+    }
+}
+///AppendEntries methods
+impl Raft {
+    ///send append entries to single id
     fn send_append_entry(&self, id: usize, entry: AppendEntriesArgs, is_heart: bool) {
         let tx = self
             .event_loop_tx
@@ -276,26 +329,101 @@ impl Raft {
             })
             .unwrap();
     }
-
-    fn start<M>(&mut self, command: &M) -> Result<(u64, u64)>
-    where
-        M: labcodec::Message,
-    {
+    ///NEXT TO DO
+    fn handle_append_reply(
+        &mut self,
+        reply: AppendEntriesReply,
+        is_heart: bool,
+        new_next_index: usize,
+    ) {
+        if reply.term > self.current_term {
+            self.current_term = reply.term;
+            self.trans_role(Role::Follower);
+        }
+        // heartbeat only need to do last one
+        if is_heart {
+            return;
+        }
+        let id = reply.from as usize;
         match self.role {
             Role::Leader => {
-                let mut data = vec![];
-                labcodec::encode(command, &mut data).map_err(Error::Encode)?;
-                self.log.push(Entry {
-                    entry_term: self.current_term,
-                    data,
-                });
-                self.sync_log();
-                Ok((self.last_log_index(), self.last_log_term()))
+                if reply.success {
+                    self.next_index[id] = new_next_index;
+                    self.match_index[id] = new_next_index - 1;
+                    self.try_commit();
+                } else {
+                    //if prev_log do not match,Resend
+                    self.next_index[id] -= 1;
+                    self.send_append_entry_at(self.next_index[id], id);
+                }
             }
-            _ => Err(Error::NotLeader),
+            _ => {}
         }
     }
+    fn send_append_entry_at(&self, at: usize, to: usize) {
+        let entries = self.log[at..].iter().cloned().collect();
+        let prev_log_index = at - 1;
+        // println!(
+        //     "{} send {:?} to {} and pli {}",
+        //     self.me, entries, to, prev_log_index
+        // );
+        self.send_append_entry(
+            to,
+            AppendEntriesArgs {
+                entries,
+                prev_log_index: prev_log_index as u64,
+                term: self.current_term,
+                leader_id: self.me as u64,
+                prev_log_term: self.log[prev_log_index].term,
+                leader_commit_index: self.commit_index,
+            },
+            false,
+        );
+    }
+    fn try_commit(&mut self) {
+        if self.role != Role::Leader {
+            return;
+        }
+        let mut new_commit_index = self.commit_index;
+        for wait_for_commit_index in self.commit_index as usize..self.log.len() {
+            let mut match_count = 1;
+            self.match_index.iter().enumerate().for_each(|(id, idx)| {
+                if id != self.me && *idx >= wait_for_commit_index {
+                    match_count += 1;
+                }
+            });
+            //why need to check term here?
+            //because of the leader may have been changed to follower in the meantime and the log may be changed in the meantime too.
+            if self.log[wait_for_commit_index].term != self.current_term {
+                continue;
+            }
+            if match_count * 2 > self.peers.len() {
+                new_commit_index = wait_for_commit_index as u64;
+            } else {
+                break;
+            }
+        }
+        self.commit_and_send_apply(new_commit_index);
+    }
+    fn commit_and_send_apply(&mut self, new_commit_index: u64) {
+        //TO DO
+        if new_commit_index <= self.commit_index {
+            return;
+        }
+
+        for i in (self.commit_index as usize + 1)..=new_commit_index as usize {
+            let msg = ApplyMsg {
+                command_valid: true,
+                command: self.log[i].data.clone(),
+                command_index: i as u64,
+            };
+
+            self.apply_tx.unbounded_send(msg).unwrap();
+        }
+        self.commit_index = new_commit_index;
+    }
 }
+///Other methods
 impl Raft {
     fn handle_task(&mut self, event: Event) {
         match event {
@@ -314,71 +442,6 @@ impl Raft {
             _ => {}
         }
     }
-    fn handle_request_reply(&mut self, reply: RequestVoteReply) {
-        if reply.term > self.current_term {
-            self.current_term = reply.term;
-            self.trans_role(Role::Follower);
-        }
-        match self.role {
-            Role::Candidate => {
-                if reply.vote_granted && reply.term == self.current_term {
-                    self.vote_from.insert(reply.id);
-                    if self.vote_from.len() * 2 > self.peers.len() {
-                        self.trans_role(Role::Leader);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    ///NEXT TO DO
-    fn handle_append_reply(
-        &mut self,
-        reply: AppendEntriesReply,
-        is_heart: bool,
-        new_next_index: usize,
-    ) {
-        if reply.term > self.current_term {
-            self.current_term = reply.term; //update
-            self.trans_role(Role::Follower);
-        }
-        // heartbeat has no need
-        if is_heart {
-            return;
-        }
-        match self.role {
-            Role::Leader => {}
-            _ => {}
-        }
-    }
-    fn hold_election(&mut self) {
-        self.vote_for = Some(self.me as u64);
-        self.vote_from.insert(self.me as u64);
-        self.send_request_vote(RequestVoteArgs {
-            term: self.current_term,
-            candidate_id: self.me as u64,
-            last_log_index: self.last_log_index(),
-            last_log_term: self.last_log_term(),
-        });
-    }
-    fn send_append_entries(&self, at: usize, to: usize) {
-        let entries = self.log[at..].iter().cloned().collect();
-        let prev_log_index = at - 1;
-
-        self.send_append_entry(
-            to,
-            AppendEntriesArgs {
-                entries,
-                prev_log_index: prev_log_index as u64,
-                term: self.current_term,
-                leader_id: self.me as u64,
-                prev_log_term: self.log[prev_log_index].entry_term,
-                leader_commit_index: self.commit_index,
-            },
-            false,
-        );
-    }
     /// send heart-beat to all peers
     fn send_all_heart_beat(&mut self) {
         for (id, _) in self.peers.iter().enumerate() {
@@ -390,8 +453,8 @@ impl Raft {
                 AppendEntriesArgs {
                     term: self.current_term,
                     leader_id: self.me as u64,
-                    prev_log_index: self.log.len() as u64,
-                    prev_log_term: self.log.last().unwrap().entry_term,
+                    prev_log_index: self.log.len() as u64 - 1,
+                    prev_log_term: self.log.last().unwrap().term,
                     entries: vec![],
                     leader_commit_index: self.commit_index as u64,
                 },
@@ -399,21 +462,24 @@ impl Raft {
             );
         }
     }
-}
-impl Raft {
-    fn last_log_index(&self) -> u64 {
-        self.log.len() as u64 - 1
-    }
-    fn last_log_term(&self) -> u64 {
-        self.log.last().unwrap().entry_term
-    }
     fn sync_log(&self) {
+        println!(
+            "-----{:?} sync_log log len is {:?}----",
+            self.me,
+            self.log.len()
+        );
         for (id, _) in self.peers.iter().enumerate() {
             if id == self.me {
                 continue;
             }
-            self.send_append_entries(self.next_index[id], id);
+            self.send_append_entry_at(self.next_index[id], id);
         }
+    }
+    fn last_log_index(&self) -> u64 {
+        self.log.len() as u64 - 1
+    }
+    fn last_log_term(&self) -> u64 {
+        self.log.last().unwrap().term
     }
 }
 
@@ -428,6 +494,8 @@ impl Raft {
         let _ = &self.persister;
         let _ = &self.peers;
     }
+
+    pub fn just_test(&self) {}
 }
 
 // Choose concurrency paradigm.
@@ -553,7 +621,6 @@ impl Node {
             is_leader: self.is_leader(),
         }
     }
-
     /// the tester calls kill() when a Raft instance won't be
     /// needed again. you are not required to do anything in
     /// kill(), but it might be convenient to (for example)
@@ -582,8 +649,10 @@ impl RaftService for Node {
             raft.current_term = args.term;
         }
         let term = raft.current_term;
-        let up_to_date = (args.last_log_index, args.last_log_term)
-            >= (raft.last_log_index(), raft.last_log_term());
+        // let up_to_date = (args.last_log_index, args.last_log_term)
+        //     >= (raft.last_log_index(), raft.last_log_term());
+        let up_to_date = (args.last_log_term, args.last_log_index)
+            >= (raft.last_log_term(), raft.last_log_index());
         let vote_granted = match raft.role {
             Role::Follower if raft.vote_for == None && up_to_date => true,
             _ => false,
@@ -596,33 +665,61 @@ impl RaftService for Node {
     }
     ///AppendEntriesArgs RPC handler
     ///handle append_entries_args
+    ///append entries sorts work
+
+    //并不是一接受到AppendEntries并且成功就commit_index更新并且apply
+    //而是leader在接收到半数成功后，才会update leader_commit_index
+    //最后通过heartbeat or next append_entry使得follower update
+    //commit index and apply to persist data
+
+    // Append_Entry Flow ↓
+    // 1.leader send append_entries to followers
+    //  leader ->A_E-> followers
+
+    // 2.follwer del with A_E and reply result to leader
+    //  follower ->reply-> leader
+
+    // 3.leader del with reply and update peer's match_index(success) or resend new_enties to peers(fail)
+    //  leader ->update-> self.match_index
+    //           \->resend-> follower
+
+    // 4.when leader get majority success from follower,update self.commit_index
+    //  leader ->update-> self.commit_index
+
+    // 5.when next Append or Heart,leader will send new leader_commit_index,follower compare it and decide to commit_and_apply or not to
+    //  leader ->A or H-> follower, follower ->cmp-> update or not update
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
         let mut raft = self.raft.lock().unwrap();
-        //initialize
         if args.term >= raft.current_term {
-            raft.trans_role(Role::Follower);
             raft.current_term = args.term;
+            raft.trans_role(Role::Follower);
         }
+        //initialize
         let term = raft.current_term;
-        let mut success = true;
+        let role = raft.role.clone();
+        let pli = args.prev_log_index as usize;
+        let plt = args.prev_log_term;
 
-        //match
-        match raft.role {
-            Role::Follower => {
-                if raft.current_term > args.term {
-                    success = false;
+        let success = match (role, raft.log.get(pli), term == args.term) {
+            (Role::Follower, Some(Entry { term, .. }), true) if *term == plt => {
+                while raft.log.len() > pli + 1 {
+                    raft.log.pop();
                 }
-                if (raft.log.len() < args.prev_log_index as usize
-                    || raft.log[args.prev_log_index as usize]
-                        != args.entries[args.prev_log_index as usize])
-                    && term == args.prev_log_term
-                {
-                    success = false;
+                let mut entries = args.entries;
+                raft.log.append(&mut entries);
+                if args.leader_commit_index > raft.commit_index {
+                    let new_commit_index = args.leader_commit_index.min(raft.last_log_index());
+                    raft.commit_and_send_apply(new_commit_index);
+                    // println!(
+                    //     "{:>} {:?} in term {:?} commit_index {:?} \n{:?}",
+                    //     raft.me, raft.role, raft.current_term, raft.commit_index, raft.log
+                    // );
+                    // println!();
                 }
+                true
             }
-            _ => success = false,
-        }
-
+            _ => false,
+        };
         Ok(AppendEntriesReply {
             from: raft.me as u64,
             term,
