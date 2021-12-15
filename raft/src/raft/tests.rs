@@ -128,15 +128,6 @@ fn test_basic_agree_2b() {
 
     cfg.end()
 }
-#[test]
-fn test_for_log_len_2b() {
-    let servers = 3;
-    let mut cfg = Config::new(servers, false);
-    cfg.begin("Test (2B): for_log_len");
-
-    cfg.one(Entry { x: 1 }, 1, false);
-    let leader = cfg.check_one_leader();
-}
 
 #[test]
 fn test_fail_agree_2b() {

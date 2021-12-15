@@ -190,8 +190,6 @@ impl Raft {
                 self.hold_election();
             }
             Role::Leader => {
-                println!("{} become leader", self.me);
-                //println!("{:?}", self.log);
                 self.next_index = vec![self.log.len(); self.peers.len()];
                 self.match_index = vec![0; self.peers.len()];
                 self.send_all_heart_beat();
@@ -211,9 +209,7 @@ impl Raft {
                     term: self.current_term,
                     data,
                 };
-                //println!("{} get a entry {:?}", self.me, entry);
                 self.log.push(entry);
-                //println!("{} now log {:?}", self.me, self.log);
                 self.sync_log();
                 Ok((self.last_log_index(), self.last_log_term()))
             }
@@ -294,7 +290,6 @@ impl Raft {
         }
     }
     fn hold_election(&mut self) {
-        println!("{} start election", self.me);
         self.vote_for = Some(self.me as u64);
         self.vote_from.insert(self.me as u64);
         self.send_request_vote(RequestVoteArgs {
@@ -363,10 +358,6 @@ impl Raft {
     fn send_append_entry_at(&self, at: usize, to: usize) {
         let entries = self.log[at..].iter().cloned().collect();
         let prev_log_index = at - 1;
-        // println!(
-        //     "{} send {:?} to {} and pli {}",
-        //     self.me, entries, to, prev_log_index
-        // );
         self.send_append_entry(
             to,
             AppendEntriesArgs {
@@ -463,11 +454,6 @@ impl Raft {
         }
     }
     fn sync_log(&self) {
-        println!(
-            "-----{:?} sync_log log len is {:?}----",
-            self.me,
-            self.log.len()
-        );
         for (id, _) in self.peers.iter().enumerate() {
             if id == self.me {
                 continue;
@@ -710,11 +696,6 @@ impl RaftService for Node {
                 if args.leader_commit_index > raft.commit_index {
                     let new_commit_index = args.leader_commit_index.min(raft.last_log_index());
                     raft.commit_and_send_apply(new_commit_index);
-                    // println!(
-                    //     "{:>} {:?} in term {:?} commit_index {:?} \n{:?}",
-                    //     raft.me, raft.role, raft.current_term, raft.commit_index, raft.log
-                    // );
-                    // println!();
                 }
                 true
             }
